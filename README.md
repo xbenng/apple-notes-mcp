@@ -23,10 +23,14 @@ An [MCP](https://modelcontextprotocol.io/) server that exposes Apple Notes to Cl
 ```bash
 git clone https://github.com/YOUR_USERNAME/apple-notes-mcp.git
 cd apple-notes-mcp
-pip install mcp html2text
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ## Usage
+
+In the config examples below, replace `/path/to/apple-notes-mcp` with the absolute path to the cloned repo.
 
 ### Claude Code (CLI)
 
@@ -36,7 +40,7 @@ Add to `~/.claude/settings.json`:
 {
   "mcpServers": {
     "apple-notes-mcp": {
-      "command": "python3",
+      "command": "/path/to/apple-notes-mcp/.venv/bin/python",
       "args": ["/path/to/apple-notes-mcp/server.py"]
     }
   }
@@ -51,7 +55,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "apple-notes": {
-      "command": "/path/to/python3",
+      "command": "/path/to/apple-notes-mcp/.venv/bin/python",
       "args": ["/path/to/apple-notes-mcp/server.py"]
     }
   }
