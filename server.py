@@ -78,41 +78,41 @@ def _html_to_markdown(html: str) -> str:
 
 
 def _fetch_all_notes() -> list[tuple[str, str]]:
-    """Return [(title, folder), ...] for all notes using fast JXA bulk fetch."""
+    """Return [(title, folder), ...] for all notes using bulk JXA property access."""
     script = """
 const app = Application("Notes");
 const names = app.notes.name();
-const containers = app.notes.container.name();
+const folders = app.notes.container.name();
 const result = [];
 for (var i = 0; i < names.length; i++) {
-    result.push({t: names[i], f: containers[i]});
+    result.push({t: names[i] || "", f: folders[i] || ""});
 }
 JSON.stringify(result);
 """
-    data = json.loads(_run_jxa(script))
+    data = json.loads(_run_jxa(script, timeout=60))
     return [(d["t"], d["f"] or "") for d in data]
 
 
 def _fetch_note_index() -> list[dict]:
-    """Return [{title, folder, created_ms, modified_ms}, ...] via fast JXA bulk fetch."""
+    """Return [{title, folder, created_ms, modified_ms}, ...] via bulk JXA property access."""
     script = """
 const app = Application("Notes");
 const names = app.notes.name();
-const containers = app.notes.container.name();
+const folders = app.notes.container.name();
 const created = app.notes.creationDate();
 const modified = app.notes.modificationDate();
 const result = [];
 for (var i = 0; i < names.length; i++) {
     result.push({
         title: names[i] || "",
-        folder: containers[i] || "",
+        folder: folders[i] || "",
         created_ms: created[i] ? created[i].getTime() : 0,
         modified_ms: modified[i] ? modified[i].getTime() : 0
     });
 }
 JSON.stringify(result);
 """
-    return json.loads(_run_jxa(script))
+    return json.loads(_run_jxa(script, timeout=60))
 
 
 def _fetch_bodies_batch(start: int, count: int) -> list[tuple[str, str]]:
@@ -228,7 +228,7 @@ def list_folders() -> str:
 const app = Application("Notes");
 JSON.stringify(app.folders.name());
 """
-    folders = json.loads(_run_jxa(script))
+    folders = json.loads(_run_jxa(script, timeout=60))
     if not folders:
         return "No folders found."
     return "\n".join(f"- {f}" for f in folders)
@@ -255,7 +255,8 @@ def list_notes(folder: str = "") -> str:
         notes = [n for n in notes if n["folder"].lower() == folder.lower()]
 
     if not notes:
-        return f"No notes found{f' in folder \"{folder}\"' if folder else ''}."
+        folder_suffix = f' in folder "{folder}"' if folder else ''
+        return f"No notes found{folder_suffix}."
 
     lines_out = []
     current_folder = None
