@@ -134,8 +134,11 @@ JSON.stringify(result);
     return [(d["name"], d["body"]) for d in data if d["name"]]
 
 
+META_KEY = "_meta"
+
+
 def _load_cache() -> dict[str, dict]:
-    """Load cache from disk. Returns {title: {folder, modified_ms, body_md}}."""
+    """Load cache from disk. Returns {title: {folder, modified_ms, body_md}, ..., _meta: {...}}."""
     if CACHE_PATH.exists():
         try:
             return json.loads(CACHE_PATH.read_text())
@@ -145,8 +148,65 @@ def _load_cache() -> dict[str, dict]:
 
 
 def _save_cache(cache: dict[str, dict]) -> None:
+    cache[META_KEY] = {"last_updated_ms": int(time.time() * 1000)}
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     CACHE_PATH.write_text(json.dumps(cache))
+
+
+def _fetch_modified_since(since_ms: int) -> list[dict]:
+    """Use JXA whose clause to fetch only notes modified after since_ms.
+
+    Notes.app filters server-side, so this is fast when few notes changed.
+    Returns [{title, folder, modified_ms, body_html}, ...].
+    """
+    script = f"""
+const app = Application("Notes");
+const cutoff = new Date({since_ms});
+const recent = app.notes.whose({{modificationDate: {{_greaterThan: cutoff}}}});
+const count = recent.length;
+const result = [];
+for (var i = 0; i < count; i++) {{
+    try {{
+        const n = recent[i];
+        result.push({{
+            title: n.name(),
+            folder: n.container.name(),
+            modified_ms: n.modificationDate().getTime(),
+            body: n.body()
+        }});
+    }} catch(e) {{}}
+}}
+JSON.stringify(result);
+"""
+    return json.loads(_run_jxa(script, timeout=120))
+
+
+def _incremental_update(cache: dict[str, dict]) -> tuple[dict[str, dict], int]:
+    """Update cache with only notes modified since last cache write.
+
+    Returns (updated_cache, num_updated). Does not detect deletions —
+    use rebuild_search_cache for that.
+    """
+    meta = cache.get(META_KEY, {})
+    since_ms = meta.get("last_updated_ms", 0)
+
+    if not since_ms:
+        # No timestamp — can't do incremental, caller should full-rebuild
+        return cache, -1
+
+    modified = _fetch_modified_since(since_ms)
+
+    for note in modified:
+        cache[note["title"]] = {
+            "folder": note["folder"],
+            "modified_ms": note["modified_ms"],
+            "body_md": _html_to_markdown(note["body"]),
+        }
+
+    if modified:
+        _save_cache(cache)
+
+    return cache, len(modified)
 
 
 def _get_body_cache(report_progress: bool = False) -> tuple[dict[str, dict], bool]:
@@ -155,12 +215,13 @@ def _get_body_cache(report_progress: bool = False) -> tuple[dict[str, dict], boo
     Fetches only notes that are new or modified since the last cache build.
     Returns (cache, was_rebuilt) where was_rebuilt=True if any bodies were fetched.
     """
-    index = _fetch_note_index()  # fast: ~0.5s
+    index = _fetch_note_index()  # slow for large libraries
     cache = _load_cache()
 
     stale = [n for n in index if
              n["title"] not in cache or
-             cache[n["title"]]["modified_ms"] != n["modified_ms"]]
+             n["title"] == META_KEY or
+             cache[n["title"]].get("modified_ms") != n["modified_ms"]]
 
     if not stale:
         return cache, False
@@ -201,6 +262,8 @@ def _get_body_cache(report_progress: bool = False) -> tuple[dict[str, dict], boo
     # Update cache entries
     for n in index:
         title = n["title"]
+        if title == META_KEY:
+            continue
         cache[title] = {
             "folder": n["folder"],
             "modified_ms": n["modified_ms"],
@@ -210,7 +273,7 @@ def _get_body_cache(report_progress: bool = False) -> tuple[dict[str, dict], boo
     # Remove deleted notes
     live_titles = {n["title"] for n in index}
     for title in list(cache.keys()):
-        if title not in live_titles:
+        if title != META_KEY and title not in live_titles:
             del cache[title]
 
     _save_cache(cache)
@@ -302,48 +365,138 @@ def search_notes(query: str, search_body: bool = True) -> str:
     """
     Search Apple Notes by title, or optionally by full content.
 
-    Title search is instant (~0.5s). Body search uses a persistent disk cache —
-    the first call builds the cache (~60-90s for large libraries); every
-    subsequent call is fast and only re-fetches notes that have changed.
+    Uses the on-disk cache for instant results (no osascript calls).
+    If no cache exists yet, run rebuild_search_cache first, or this will
+    fall back to a slow osascript-based search.
 
     Args:
         query: Text to search for (case-insensitive).
         search_body: If True, search note bodies in addition to titles.
-                     Default is False (title-only, instant).
+                     Default is True.
     """
     if not query.strip():
         return "Please provide a non-empty search query."
 
     q_lower = query.lower()
 
-    if not search_body:
-        notes = _fetch_all_notes()
-        matches = [(t, f, "title") for t, f in notes if q_lower in t.lower()]
-        suffix = ""
-    else:
-        t0 = time.time()
-        cache, rebuilt = _get_body_cache(report_progress=True)
-        elapsed = time.time() - t0
+    # Fast path: use disk cache if available, with incremental refresh
+    cache = _load_cache()
+
+    if cache:
+        # Try to refresh cache with notes modified since last write
+        try:
+            cache, num_updated = _incremental_update(cache)
+            if num_updated > 0:
+                update_note = f", {num_updated} note(s) refreshed"
+            elif num_updated == 0:
+                update_note = ", up to date"
+            else:
+                update_note = ", no timestamp — run rebuild_search_cache for full refresh"
+        except Exception:
+            update_note = ", incremental refresh failed — using stale cache"
 
         matches = []
         for title, entry in cache.items():
+            if title == META_KEY:
+                continue
             folder = entry.get("folder", "")
-            body_md = entry.get("body_md", "")
             in_title = q_lower in title.lower()
-            in_body = q_lower in body_md.lower()
+            in_body = False
+            if search_body:
+                body_md = entry.get("body_md", "")
+                in_body = q_lower in body_md.lower()
             if in_title or in_body:
-                match_type = "title+body" if (in_title and in_body) else ("title" if in_title else "body")
+                match_type = ("title+body" if (in_title and in_body)
+                              else ("title" if in_title else "body"))
                 matches.append((title, folder, match_type))
-
-        suffix = f"\n\n_({'Cache rebuilt' if rebuilt else 'Cache hit'} in {elapsed:.1f}s)_"
+        suffix = f"\n\n_(Cache hit — {len(cache) - (1 if META_KEY in cache else 0)} notes indexed{update_note})_"
+    else:
+        # No cache — fall back to slow osascript path for title-only,
+        # or build the cache for body search
+        if not search_body:
+            try:
+                notes = _fetch_all_notes()
+                matches = [(t, f, "title") for t, f in notes if q_lower in t.lower()]
+            except Exception as e:
+                return f"No cache available and Notes query timed out: {e}\nRun rebuild_search_cache to build the index."
+            suffix = ""
+        else:
+            t0 = time.time()
+            try:
+                cache, rebuilt = _get_body_cache(report_progress=True)
+            except Exception as e:
+                return f"No cache available and Notes query timed out: {e}\nRun rebuild_search_cache to build the index."
+            elapsed = time.time() - t0
+            matches = []
+            for title, entry in cache.items():
+                if title == META_KEY:
+                    continue
+                folder = entry.get("folder", "")
+                body_md = entry.get("body_md", "")
+                in_title = q_lower in title.lower()
+                in_body = q_lower in body_md.lower()
+                if in_title or in_body:
+                    match_type = ("title+body" if (in_title and in_body)
+                                  else ("title" if in_title else "body"))
+                    matches.append((title, folder, match_type))
+            suffix = f"\n\n_({'Cache built' if rebuilt else 'Cache hit'} in {elapsed:.1f}s)_"
 
     if not matches:
-        return f'No notes found matching "{query}".{suffix if search_body else ""}'
+        return f'No notes found matching "{query}".{suffix}'
 
     lines = [f'Found {len(matches)} note(s) matching "{query}":\n']
     for title, folder, match_type in sorted(matches, key=lambda x: (x[1].lower(), x[0].lower())):
         lines.append(f"  - **{title}** ({folder}) — {match_type}")
-    return "\n".join(lines) + (suffix if search_body else "")
+    return "\n".join(lines) + suffix
+
+
+@mcp.tool()
+def edit_note(title: str, content: str, append: bool = False) -> str:
+    """
+    Edit an Apple Note's body content.
+
+    Args:
+        title: The exact title of the note to edit.
+        content: New content in HTML format. Supports standard HTML tags
+                 (p, br, b, i, u, ul, ol, li, a, h1-h6, blockquote, pre, code).
+                 Plain text without tags is also accepted.
+        append: If True, append content to the end of the existing note.
+                If False (default), replace the entire note body.
+    """
+    safe_title = json.dumps(title)
+    safe_content = json.dumps(content)
+
+    if append:
+        body_line = "notes[0].body = notes[0].body() + newContent;"
+    else:
+        body_line = "notes[0].body = newContent;"
+
+    script = f"""
+const app = Application("Notes");
+const targetTitle = {safe_title};
+const newContent = {safe_content};
+const notes = app.notes.whose({{name: targetTitle}});
+if (notes.length === 0) {{
+    "ERROR: No note found with title: " + targetTitle;
+}} else {{
+    {body_line}
+    "OK";
+}}
+"""
+    result = _run_jxa(script, timeout=30)
+    if result.startswith("ERROR:"):
+        return result
+
+    # Invalidate cache for this note so next search reflects changes
+    try:
+        cache = _load_cache()
+        if title in cache:
+            del cache[title]
+            _save_cache(cache)
+    except Exception:
+        pass
+
+    return f'Note "{title}" {"appended to" if append else "updated"} successfully.'
 
 
 @mcp.tool()
