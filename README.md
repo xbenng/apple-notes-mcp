@@ -6,10 +6,15 @@ An [MCP](https://modelcontextprotocol.io/) server that exposes Apple Notes to Cl
 
 ## Features
 
-- List all folders and notes with metadata (created, modified dates)
-- Get the full content of any note by title (returned as Markdown)
-- Search notes by title or full body text
-- Persistent disk cache for fast body search — only re-fetches notes that have changed
+- List folders (grouped by account, with note counts) and notes with metadata, most recently modified first
+- Get the full content of any note as Markdown, by id or exact title (ambiguous titles list the candidate ids)
+- Search notes by title or full body text, with match snippets
+- Create notes, and edit existing ones (replace or append HTML body; no delete)
+- Persistent disk cache for fast body search: only re-fetches notes that have changed
+- Skips "Recently Deleted"; password-protected notes are listed but not read
+- Inline base64 images are stripped from returned and searched content
+
+Notes are identified by their Notes id (`x-coredata://...`) because titles are not unique.
 
 ## Requirements
 
@@ -76,3 +81,12 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 - Body search builds a cache at `~/.cache/apple-notes-mcp/notes.json` on first use (~60–90s for large libraries). Subsequent searches are fast and incremental.
 - Apple Notes must be authorized for automation access in **System Settings → Privacy & Security → Automation**.
+
+### Remote (Claude Code on another host)
+
+The server speaks stdio, so a Linux host can run it over SSH (Notes automation works from an SSH session):
+
+```bash
+claude mcp add -s user apple-notes -- ssh -o BatchMode=yes -o ConnectTimeout=10 \
+  mac.lan /path/to/apple-notes-mcp/.venv/bin/python /path/to/apple-notes-mcp/server.py
+```
