@@ -27,14 +27,21 @@ Claude Desktop config (~/.../claude_desktop_config.json):
       }
     }
 
-Remote (e.g. Claude Code on a Linux host), as a stdio server over SSH:
-    ssh -o BatchMode=yes mac.lan /path/to/.venv/bin/python /path/to/server.py
+Remote (e.g. Claude Code on a Linux host), as a streamable-HTTP server:
+    python3 server.py --http [--host 0.0.0.0] [--port 3002]
+Clients must send "Authorization: Bearer <token>", where the token comes from
+$APPLE_NOTES_MCP_TOKEN or ~/.config/apple-notes-mcp/token (created on first run).
+The MCP endpoint is http://<mac>:3002/mcp.
 """
 
+import argparse
 import concurrent.futures
+import hmac
 import html
 import json
+import os
 import re
+import secrets
 import subprocess
 import time
 from datetime import datetime
@@ -536,5 +543,65 @@ function run(argv) {
     return (f'Note "{entry["title"]}" {"appended to" if append else "updated"} '
             f'({entry["account"]} / {entry["folder"]}). id={entry["id"]}')
 
+
+# ---------------------------------------------------------------------------
+# HTTP transport
+# ---------------------------------------------------------------------------
+
+TOKEN_PATH = Path.home() / ".config" / "apple-notes-mcp" / "token"
+
+
+def _load_token() -> str:
+    """Bearer token from $APPLE_NOTES_MCP_TOKEN, else the token file (created if missing)."""
+    token = os.environ.get("APPLE_NOTES_MCP_TOKEN", "").strip()
+    if token:
+        return token
+    if not TOKEN_PATH.exists():
+        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_urlsafe(32) + "\n")
+    return TOKEN_PATH.read_text().strip()
+
+
+class _BearerAuth:
+    """ASGI middleware: reject HTTP requests without the expected bearer token."""
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            got = dict(scope.get("headers") or []).get(b"authorization", b"")
+            if not hmac.compare_digest(got, self.expected):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain"),
+                                        (b"www-authenticate", b"Bearer")]})
+                await send({"type": "http.response.body", "body": b"unauthorized\n"})
+                return
+        await self.app(scope, receive, send)
+
+
+def _run_http(host: str, port: int) -> None:
+    import uvicorn
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    # Every request carries the bearer token, which a DNS-rebinding page can't
+    # supply, so the Host-header allowlist (localhost-only by default) is off.
+    mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    mcp.settings.stateless_http = True  # no session state to lose across restarts
+    app = _BearerAuth(mcp.streamable_http_app(), _load_token())
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
 if __name__ == "__main__":
-    mcp.run()
+    parser = argparse.ArgumentParser(description="Apple Notes MCP server")
+    parser.add_argument("--http", action="store_true", help="serve streamable HTTP instead of stdio")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=3002)
+    args = parser.parse_args()
+    if args.http:
+        _run_http(args.host, args.port)
+    else:
+        mcp.run()
